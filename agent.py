@@ -1,34 +1,25 @@
 from typing import Annotated, TypedDict, List
 import os
 import requests
+import json
+import traceback
+import gradio as gr
+import subprocess
+from dotenv import load_dotenv
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
 from langchain_openai import ChatOpenAI
-from dotenv import load_dotenv
-import gradio as gr
-import json
-import traceback
 
 # === Load env ===
 load_dotenv(override=True)
 
-pushover_token = os.getenv("PUSHOVER_TOKEN")
-pushover_user = os.getenv("PUSHOVER_USER")
-pushover_url = "https://api.pushover.net/1/messages.json"
-
-# === Tool ===
-def push_tool(msg: str) -> str:
-    try:
-        requests.post(pushover_url, data={"token": pushover_token, "user": pushover_user, "message": msg})
-        return "✅ Notificação enviada."
-    except Exception as e:
-        return f"❌ Falha ao enviar: {str(e)}"
-
-# === State ===
+# === State === // grava coisas necessárias de um node para outro do grafo
 class State(TypedDict):
     messages: Annotated[List[dict], add_messages]
-    intent: str
-    push_text: str
+    intent: str # variável que trigga o router function
+    num1: float
+    num2: float
+    result: float
 
 # === LLM ===
 llm = ChatOpenAI(
@@ -38,15 +29,14 @@ llm = ChatOpenAI(
 )
 
 # === Nodes ===
-def llm_node(state: State) -> State:
+def llm_parser_node(state: State) -> State:
     system_prompt = {
         "role": "system",
         "content": (
-            "You are a JSON-only assistant. If the user asks to send a message, notification, or push, "
-            "respond ONLY with a JSON object:\n"
-            '{ "intent": "push", "push_text": "message to send" }\n'
-            "If no push is needed, respond with:\n"
-            '{ "intent": "end", "push_text": "" }'
+            "You are a JSON-only assistant. Extract the operation and two numbers from the user request."
+            " Respond ONLY with a JSON object like:\n"
+            '{ "intent": "sum", "num1": 10, "num2": 20 }\n'
+            "Possible intents: 'sum', 'subtract', 'multiply', 'divide'."
         )
     }
     messages = [system_prompt] + state["messages"]
@@ -54,67 +44,109 @@ def llm_node(state: State) -> State:
 
     try:
         parsed = json.loads(response.content.strip())
-        state["intent"] = parsed.get("intent", "end")
-        state["push_text"] = parsed.get("push_text", "")
+        state["intent"] = parsed.get("intent", "sum")
+        state["num1"] = float(parsed.get("num1", 0))
+        state["num2"] = float(parsed.get("num2", 0))
     except Exception:
-        state["intent"] = "end"
-        state["push_text"] = ""
-        state["messages"].append({
-            "role": "assistant",
-            "content": f"❌ JSON inválido: {response.content}"
-        })
+        state["intent"] = "sum"
+        state["num1"] = 0
+        state["num2"] = 0
+        state["messages"].append({"role": "assistant", "content": f"❌ Failed to parse JSON: {response.content}"})
         return state
 
-    state["messages"].append({
-        "role": "assistant",
-        "content": response.content
-    })
+    state["messages"].append({"role": "assistant", "content": response.content})
     return state
 
-def push_node(state: State) -> State:
-    result = push_tool(state["push_text"])
-    state["messages"].append({"role": "tool", "name": "send_push_notification", "content": result})
+def sum_node(state: State) -> State:
+    state["result"] = state["num1"] + state["num2"]
     return state
 
-def route_decision(state: State) -> str:
-    return state["intent"]
+def subtract_node(state: State) -> State:
+    state["result"] = state["num1"] - state["num2"]
+    return state
+
+def multiply_node(state: State) -> State:
+    state["result"] = state["num1"] * state["num2"]
+    return state
+
+def divide_node(state: State) -> State:
+    try:
+        state["result"] = state["num1"] / state["num2"]
+    except ZeroDivisionError:
+        state["result"] = float("inf")
+    return state
+
+def final_node(state: State) -> State:
+    result_msg = f"✅ Resultado: {state['num1']} {state['intent']} {state['num2']} = {state['result']}"
+    state["messages"].append({"role": "assistant", "content": result_msg})
+    return state
+
+# === Router ===
+def math_router(state: State) -> str:
+    return {
+        "sum": "sum",
+        "subtract": "subtract",
+        "multiply": "multiply",
+        "divide": "divide"
+    }.get(state.get("intent", "sum"), "sum")
+
+# === Render Mermaid Diagram ===
+def render_mermaid_graph(app, mmd_file="graph.mmd", output_image="graph.png"):
+    mermaid_code = app.get_graph().draw_mermaid()
+    with open(mmd_file, "w") as f:
+        f.write(mermaid_code)
+    try:
+        subprocess.run(["mmdc", "-i", mmd_file, "-o", output_image], check=True)
+        print(f"✅ Diagrama salvo como {output_image}")
+    except Exception as e:
+        print(f"❌ Falha ao gerar diagrama: {e}")
 
 # === Build Graph ===
 graph_builder = StateGraph(State)
-graph_builder.add_node("llm", llm_node)
-graph_builder.add_node("push", push_node)
 
-graph_builder.set_entry_point("llm")
-graph_builder.add_conditional_edges("llm", route_decision, {
-    "push": "push",
-    "end": END
+graph_builder.add_node("llm_parser", llm_parser_node)
+graph_builder.add_node("sum", sum_node)
+graph_builder.add_node("subtract", subtract_node)
+graph_builder.add_node("multiply", multiply_node)
+graph_builder.add_node("divide", divide_node)
+graph_builder.add_node("final", final_node)
+
+graph_builder.set_entry_point("llm_parser")
+graph_builder.add_conditional_edges("llm_parser", math_router, {
+    "sum": "sum",
+    "subtract": "subtract",
+    "multiply": "multiply",
+    "divide": "divide"
 })
-graph_builder.add_edge("push", END)
-graph = graph_builder.compile()
+graph_builder.add_edge("sum", "final")
+graph_builder.add_edge("subtract", "final")
+graph_builder.add_edge("multiply", "final")
+graph_builder.add_edge("divide", "final")
+graph_builder.add_edge("final", END)
 
-# === Gradio UI ===
+graph = graph_builder.compile()
+render_mermaid_graph(graph)
+
+# === Gradio Chat ===
 def chat(user_input: str, history):
     try:
         messages = [{"role": "user", "content": user_input}]
-        result = graph.invoke({"messages": messages, "intent": "", "push_text": ""})
-
-        if result.get("intent") == "end":
-            # End conversation with a clear message
-            return "👍 Entendi. Nenhuma notificação será enviada. Encerrando conversa."
-
-        if result.get("intent") == "push":
-            return f"📬 Notificação enviada com sucesso: {result['push_text']}"
-
-        return result["messages"][-1]["content"]
-
+        result = graph.invoke({
+            "messages": messages,
+            "intent": "",
+            "num1": 0,
+            "num2": 0,
+            "result": 0
+        })
+        return result["messages"][-1].content
     except Exception as e:
         traceback.print_exc()
         return f"❌ Erro: {str(e)}"
 
-# === Launch Gradio
+# === Launch UI ===
 gr.ChatInterface(
     fn=chat,
     type="messages",
-    title="📲 Assistente de Push Notifications",
-    description="Peça para enviar uma notificação push ou finalize a conversa."
+    title="🧠 Calculadora com LLM + LangGraph",
+    description="Peça uma operação matemática: somar, subtrair, multiplicar, dividir."
 ).launch()
